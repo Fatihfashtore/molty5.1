@@ -52,14 +52,17 @@ def _restore_from_env() -> dict | None:
     owner_addr = os.getenv("OWNER_EOA", "").strip()
     agent_name = os.getenv("AGENT_NAME", "").strip()
 
-    # Railway needs a complete existing identity. API key alone is not enough for Web3/game actions.
+    # Railway needs a complete existing identity.
+    # API key alone is not enough for Web3/game actions.
     if not api_key:
         return None
+
     missing = []
     if not agent_pk:
         missing.append("AGENT_PRIVATE_KEY")
     if not agent_addr:
         missing.append("AGENT_WALLET_ADDRESS")
+
     if missing:
         raise FatalSetupError(
             "API_KEY exists but wallet credentials are incomplete. Missing Railway Variables: "
@@ -67,7 +70,9 @@ def _restore_from_env() -> dict | None:
         )
 
     log.info("Restoring credentials from Railway Variables...")
+
     save_agent_wallet(agent_addr, agent_pk)
+
     if owner_pk and owner_addr:
         save_owner_wallet(owner_addr, owner_pk)
 
@@ -77,7 +82,9 @@ def _restore_from_env() -> dict | None:
         "agent_wallet_address": agent_addr,
         "owner_eoa": owner_addr,
     }
+
     save_credentials(creds)
+
     save_owner_intake(
         {
             "agent_name": creds["agent_name"],
@@ -87,13 +94,15 @@ def _restore_from_env() -> dict | None:
             "owner_wallet_generated": bool(owner_pk),
         }
     )
+
     log.info("Credentials restored from env vars; skipping account creation")
     return creds
 
 
-def _require_onboarding_or_existing_credentials():
+def _require_onboarding_or_existing_credentials() -> None:
     if ONBOARDING_TOKEN:
         return
+
     raise FatalSetupError(
         "Missing API_KEY and ONBOARDING_TOKEN. ClawRoyale now requires an existing API key "
         "or an official onboarding token for POST /accounts. In Railway Variables, either set "
@@ -101,6 +110,139 @@ def _require_onboarding_or_existing_credentials():
     )
 
 
+async def run_first_run_intake() -> dict:
+    restored = _restore_from_env()
+    if restored:
+        return restored
+
+    # Old bot behavior generated wallets and then POSTed /accounts with no auth.
+    # New behavior: fail fast unless ClawRoyale has provided ONBOARDING_TOKEN.
+    _require_onboarding_or_existing_credentials()
+
+    log.info("First-run account creation with ONBOARDING_TOKEN")
+
+    agent_name = _ask_or_env(
+        "Enter agent name (max 50 chars): ",
+        AGENT_NAME,
+        "ClawAgent",
+    )[:50]
+
+    log.info("Generating Agent EOA...")
+    agent_address, agent_pk = generate_agent_wallet()
+    save_agent_wallet(agent_address, agent_pk)
+    update_env_file("AGENT_WALLET_ADDRESS", agent_address)
+    update_env_file("AGENT_PRIVATE_KEY", agent_pk)
+
+    owner_address = ""
+    owner_pk = ""
+
+    if ADVANCED_MODE:
+        log.info("Advanced mode: generating Owner EOA...")
+        owner_address, owner_pk = generate_owner_wallet()
+        save_owner_wallet(owner_address, owner_pk)
+        update_env_file("OWNER_EOA", owner_address)
+        update_env_file("OWNER_PRIVATE_KEY", owner_pk)
+    else:
+        owner_address = _ask_or_env(
+            "Enter your Owner EOA address (0x...): ",
+            OWNER_EOA,
+            "",
+        )
+
+        if not owner_address.startswith("0x") or len(owner_address) != 42:
+            raise FatalSetupError(
+                "Missing or invalid OWNER_EOA. Set OWNER_EOA or use ADVANCED_MODE=true."
+            )
+
+        update_env_file("OWNER_EOA", owner_address)
+
+    api = MoltyAPI(use_onboarding_token=True)
+
+    try:
+        result = await api.create_account(agent_name, agent_address)
+
+    except APIError as exc:
+        if exc.code == "CONFLICT":
+            existing = load_credentials()
+            if existing:
+                return existing
+
+            raise FatalSetupError(
+                "Wallet is already registered, but local credentials are missing. "
+                "Set the existing API_KEY in Railway Variables."
+            ) from exc
+
+        if exc.code == "AUTH_TOKEN_INVALID":
+            raise FatalSetupError(
+                "Invalid or missing ONBOARDING_TOKEN. Get a valid token from ClawRoyale, "
+                "or set existing API_KEY + AGENT_PRIVATE_KEY + AGENT_WALLET_ADDRESS."
+            ) from exc
+
+        raise
+
+    finally:
+        await api.close()
+
+    api_key = result.get("apiKey", "") or result.get("api_key", "")
+    account_id = result.get("accountId", "")
+    public_id = result.get("publicId", "")
+
+    if not api_key:
+        raise FatalSetupError("POST /accounts succeeded but no apiKey was returned.")
+
+    creds = {
+        "api_key": api_key,
+        "agent_name": agent_name,
+        "account_id": account_id,
+        "public_id": public_id,
+        "agent_wallet_address": agent_address,
+        "owner_eoa": owner_address,
+    }
+
+    save_credentials(creds)
+    update_env_file("API_KEY", api_key)
+    update_env_file("AGENT_NAME", agent_name)
+
+    save_owner_intake(
+        {
+            "agent_name": agent_name,
+            "advanced_mode": ADVANCED_MODE,
+            "owner_eoa": owner_address,
+            "agent_wallet_generated": True,
+            "owner_wallet_generated": ADVANCED_MODE,
+        }
+    )
+
+    try:
+        from bot.utils.railway_sync import is_railway, sync_all_to_railway
+
+        if is_railway():
+            await sync_all_to_railway(creds, agent_pk, owner_pk)
+
+    except Exception as exc:
+        log.warning("Railway sync skipped or failed: %s", exc)
+
+    return creds
+
+
+async def ensure_account_ready() -> dict:
+    """Ensure account exists. Run first-run intake if needed."""
+
+    restored = _restore_from_env()
+    if restored:
+        return restored
+
+    if is_first_run():
+        return await run_first_run_intake()
+
+    creds = load_credentials()
+
+    if not creds or not creds.get("api_key"):
+        log.warning("Credentials file exists but has no api_key. Re-running intake.")
+        return await run_first_run_intake()
+
+    log.info("Returning existing account: %s", creds.get("agent_name", "unknown"))
+    return creds
 async def run_first_run_intake() -> dict:
     restored = _restore_from_env()
     if restored:
