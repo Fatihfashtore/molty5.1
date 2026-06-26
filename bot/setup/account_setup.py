@@ -315,8 +315,8 @@ async def ensure_account_ready() -> dict:
 
 
 async def ensure_account_ready() -> dict:
-    """
-    Ensure account exists. Run first-run intake if needed.
+    
+    Ensure account exists. Run first-run intake if needed. 
     Returns credentials dict with api_key.
   
     if is_first_run():
